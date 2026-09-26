@@ -12,17 +12,18 @@
  *   node xk.mjs --targets 16,22 --dry-run      演练：只打印本来会发什么
  *   node xk.mjs --targets 16,22 --now          立即抢
  *   node xk.mjs --targets 16,22 --at 20:00:00  定时抢（提前 10s 开冲，持续 40s）
+ *   node xk.mjs --targets 16,22,30 --now --concurrency 3  3 门同时开冲（谁快谁上）
  *   node xk.mjs --logout                       清除本地会话缓存
  *
  * 参数：
  *   --targets 16,22      目标课程编号，按优先级从高到低
  *   --type class|grade   报名类型，默认 class（班级选修）
  *   --at HH:mm:ss        开放时刻；--lead 秒提前开冲（默认 10）
- *   --duration 40        开放后持续抢多少秒（默认 40）
- *   --interval 1000      每轮间隔 ms（默认 1000，±20% 抖动）
- *   --burst 1            每门每轮发几次（默认 1，建议保持）
+ *   --duration 40        开放后持续抢多少秒（默认 40，到点即停）
+ *   --burst 1            抢到一门课后该 slot 连发几次再换（默认 1）
+ *   --concurrency 1      最大并发：同时在飞的 add_sign 数（默认 1，可配）
+ *   --node-concurrency N 改 Node 全局 fetch 的连接上限（默认跟随 --concurrency）
  *   --max-posts 300      全局 POST 次数硬上限
- *   --min-gap 400        两次 POST 之间的最小间隔 ms
  *   --dry-run            演练，绝不发送 add_sign
  *   --now                立即开始
  *   --ignore-existing    已选课位冲突时也照抢（默认跳过以省 POST）
@@ -38,9 +39,19 @@
  * 省 POST 的设计：
  *   1) 会话缓存到 state/session.json，重复运行不重复登录
  *   2) 等待期间只发 GET，不发 POST
- *   3) 每门每轮只发 1 次；成功后立即停止该门及所有课位冲突目标
- *   4) 已满 / 已报名 / 课位冲突 → 永久停止，不做无意义重试
- *   5) --min-gap 与 --max-posts 双重硬限制
+ *   3) 成功 / 已满 / 已报名 / 课位冲突 → 立刻永久停掉该门，不再重试
+ *   4) POST 预算先占坑再发，并发下也不超发
+ *
+ * 并发：
+ *   没有轮次、没有发车间隔：起 --concurrency 个常驻 worker，一空闲就抢下一发，
+ *   直到成功 / 已满 / 已选 / 课位冲突 / --duration 到点 / --max-posts 打满 / Ctrl+C。
+ *   每个 worker 抢哪一门：
+ *     1) 优先「当前没在飞、且与在飞科目课位不冲突」里优先级最高的那门；
+ *     2) 都占满了，就把这一发加到优先级最高的在飞科目上 —— 同一门课并行抢同一个名额。
+ *   同一门课的 --burst 是「这一门连发几次再让出 slot」。
+ *   启动时还会把 Node 全局 fetch 的连接上限压到 --node-concurrency（默认 = --concurrency），
+ *   抢课过程之外的登录 / 列表 / 核对这些请求也受这个全局上限管。
+ *   没有间隔意味着失败重试会打得很快，--max-posts 是唯一的刹车，紧张就调小它。
  */
 import { readFile, writeFile, appendFile, mkdir, rm } from 'node:fs/promises'
 
@@ -62,6 +73,8 @@ const LOG_DIR = 'logs'
 const SRC = new URL(import.meta.url)
 
 // ───────────────────────────── 参数 ─────────────────────────────
+const cfg = JSON.parse(await readFile(new URL('./config.json', SRC), 'utf8'))
+
 function parseArgs(argv) {
   const out = { _: [] }
   for (let i = 0; i < argv.length; i++) {
@@ -75,16 +88,22 @@ function parseArgs(argv) {
   return out
 }
 const argv = parseArgs(process.argv.slice(2))
+/** 取正整数，非法/缺省 → fallback */
+const toCount = (v, fallback) => {
+  const n = Number(v)
+  return Number.isFinite(n) ? Math.max(1, Math.floor(n)) : fallback
+}
+const CONCURRENCY = toCount(argv.concurrency ?? argv['max-concurrency'] ?? cfg.concurrency, 1)
 const OPT = {
   targets: String(argv.targets ?? '').split(/[,，\s]+/).filter(Boolean).map(Number),
   type: String(argv.type ?? 'class'),
   at: argv.at ? String(argv.at) : null,
   lead: Number(argv.lead ?? 10),
   duration: Number(argv.duration ?? 40),
-  interval: Number(argv.interval ?? 1000),
-  burst: Math.max(1, Number(argv.burst ?? 1)),
+  burst: toCount(argv.burst ?? 1, 1),
+  concurrency: CONCURRENCY,
+  nodeConcurrency: toCount(argv['node-concurrency'] ?? cfg.node_concurrency, CONCURRENCY),
   maxPosts: Number(argv['max-posts'] ?? 300),
-  minGap: Number(argv['min-gap'] ?? 400),
   dryRun: !!argv['dry-run'],
   verify: !argv['no-verify'],
   now: !!argv.now,
@@ -124,12 +143,47 @@ class CookieJar {
   load(obj) { for (const [k, v] of Object.entries(obj ?? {})) this.map.set(k, v) }
 }
 
+// ───────────── Node 全局 fetch 并发上限（内置 undici 全局 dispatcher） ─────────────
+/**
+ * Node 内置 fetch 走内置 undici，其全局 dispatcher 默认 connections=null，即不设上限。
+ * 启动时按配置把「同一 origin 的连接数」压到上限：全站并发都不会超过配置值 ——
+ * 不只是抢课，登录 / 列表 / 事后核对这些请求也一并受控。
+ *
+ * 全局 dispatcher 挂在 undici 的内部 symbol 上（Node 没有公开导出，undici 也不在依赖里），
+ * 所以只能借现有 dispatcher 的构造器造一个新的换上：
+ *   new Headers()          触发内置 undici 懒加载（不发任何请求）
+ *   globalThis[KEY]        全局 dispatcher 本体
+ * 必须在任何请求发出前调用。
+ */
+const DISPATCHER_KEY = Symbol.for('undici.globalDispatcher.1')
+function applyGlobalConcurrency(n) {
+  try {
+    if (!globalThis[DISPATCHER_KEY]) new Headers()
+    const prev = globalThis[DISPATCHER_KEY]
+    if (typeof prev?.dispatch !== 'function' || typeof prev?.constructor !== 'function') {
+      return { ok: false, why: '内置 undici 全局 dispatcher 不可达' }
+    }
+    const Agent = prev.constructor
+    globalThis[DISPATCHER_KEY] = new Agent({ connections: n, pipelining: 1 })
+    return { ok: true, agent: Agent.name }
+  } catch (err) {
+    return { ok: false, why: String(err?.message ?? err) }
+  }
+}
+
 // ─────────────────────────── HTTP 层 ───────────────────────────
 const jar = new CookieJar()
 const requestLog = []
 let journalPath = null
 let postCount = 0
-let lastPostAt = 0
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** 抢名额：先占一个 POST 坑（同步执行，并发下也不会超发），没了就返回 false */
+function reservePost() {
+  if (postCount >= OPT.maxPosts) return false
+  postCount++
+  return true
+}
 
 async function request(url, { method = 'GET', body = null, ajax = false, redirect = 'follow', referer = null, timeoutMs = 15000 } = {}) {
   const headers = {
@@ -233,13 +287,20 @@ function classify(res) {
   return { kind: 'retry', code: null, msg: `非JSON HTTP=${res.status} ${String(res.text).slice(0, 60)}` }
 }
 
+// ──────────────────── 同一门课多发并发的结果归并 ────────────────────
+/**
+ * 同一门课被多个 worker 并发抢时，落在 done 里的结果取最好的一发：
+ * 成功 > 已选 > 可重试 > 已满 > 预算耗尽 > 课位冲突
+ * 同一门课被多发并发抢时，一门课只认**先落地的那一发**：后到的如果更差（已满、已选重复）
+ * 就直接丢掉、不再上报；「已满」排这么后，是为了「一发说满、另一发抢成了」时以成功为准。
+ */
+const RANK = { success: 0, already: 1, retry: 2, loggedout: 2, full: 3, aborted: 4, conflict: 5 }
+
 // ──────────────────────── 课位互斥 ────────────────────────
 const slotsOf = (pos) => new Set(String(pos ?? '').split(/[,，、/\s]+/).map((s) => s.trim()).filter(Boolean))
 function conflicts(a, b) { for (const s of a) if (b.has(s)) return true; return false }
 
 // ──────────────────────── 账号动作 ────────────────────────
-const cfg = JSON.parse(await readFile(new URL('./config.json', SRC), 'utf8'))
-
 async function loadSession() {
   if (OPT.relogin) return false
   try {
@@ -257,7 +318,7 @@ async function saveSession() {
 async function login() {
   const body = new URLSearchParams({ name: cfg.name, id_number: cfg.id_number }).toString()
   const res = await request(URLS.login, { method: 'POST', body, redirect: 'manual', referer: URLS.login })
-  postCount++
+  reservePost()
   console.log(`  [登录] POST /passport/login -> ${res.status}${res.location ? ` → ${res.location.replace(BASE, '')}` : ''}  (cookie: ${jar.names().join(', ') || '无'})`)
   return res
 }
@@ -285,14 +346,10 @@ async function ensureLogin() {
 }
 
 async function addSign(projectId, type) {
-  if (postCount >= OPT.maxPosts) return { kind: 'aborted', msg: 'POST 预算已用尽' }
-  const gap = Date.now() - lastPostAt
-  if (lastPostAt && gap < OPT.minGap) await new Promise((r) => setTimeout(r, OPT.minGap - gap))
+  if (!reservePost()) return { kind: 'aborted', msg: 'POST 预算已用尽' }
   const res = await request(URLS.addSign, { method: 'POST', body: `project_id=${projectId}&type=${type}`, ajax: true })
-  postCount++
-  lastPostAt = Date.now()
   const cls = classify(res)
-  if (journalPath) await appendFile(journalPath, `${JSON.stringify({ ts: new Date().toISOString(), kind: 'sign', id: projectId, type, httpStatus: res.status, ...cls })}\n`)
+  if (journalPath) await appendFile(journalPath, `${JSON.stringify({ ts: new Date().toISOString(), kind: 'sign', id: projectId, type, httpStatus: res.status, verdict: cls.kind, msg: cls.msg, code: cls.code ?? null })}\n`)
   return cls
 }
 
@@ -338,9 +395,12 @@ async function main() {
   }
 
   journalPath = `${LOG_DIR}/xk-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`
+  const nodeLimit = applyGlobalConcurrency(OPT.nodeConcurrency)
   banner('无锡一中选修课抢课工具 · 纯 fetch 版')
   console.log(`  账号：${cfg.name} / ${cfg.id_number}`)
   console.log(`  日志：${journalPath}`)
+  if (nodeLimit.ok) console.log(`  Node 全局 fetch：同一服务器最多 ${OPT.nodeConcurrency} 个并发连接（内置 undici 全局 dispatcher）`)
+  else console.log(`  ! Node 全局 fetch 并发上限未生效：${nodeLimit.why} —— 仍由本工具按 concurrency=${OPT.concurrency} 限流`)
 
   // ─────── --check / --list ───────
   if (OPT.check || OPT.list) {
@@ -413,65 +473,123 @@ async function main() {
     while (Date.now() < startAt) {
       const left = Math.ceil((startAt - Date.now()) / 1000)
       process.stdout.write(`\r  倒计时 ${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}   `)
-      await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(100, startAt - Date.now()))))
+      await sleep(Math.min(1000, Math.max(100, startAt - Date.now())))
     }
     process.stdout.write('\n')
   }
   if (hardEnd == null) hardEnd = Date.now() + OPT.duration * 1000
 
   const startedAt = Date.now()
-  let round = 0
   let stop = false
   process.on('SIGINT', () => { stop = true; console.log('\n收到中断，正在收尾…') })
 
-  console.log(`\n开始抢课：type=${OPT.type}  interval=${OPT.interval}ms  burst=${OPT.burst}  max-posts=${OPT.maxPosts}${OPT.dryRun ? '  [DRY-RUN 不发 POST]' : ''}`)
-  console.log('Ctrl+C 可随时停止\n')
+  console.log(`\n开始抢课：type=${OPT.type}  burst=${OPT.burst}  concurrency=${OPT.concurrency}  max-posts=${OPT.maxPosts}${OPT.dryRun ? '  [DRY-RUN 不发 POST]' : ''}`)
+  console.log('无轮次、无间隔：一空闲就抢下一发，直到成功 / 已满 / 到点 / 预算打满。Ctrl+C 可随时停止\n')
 
-  while (pending.size && Date.now() < hardEnd && !stop) {
-    round++
-    let won = false
+  // 当前有请求在飞的科目：id → { slots, refs }，refs = 占着它的 worker 数
+  const busy = new Map()
 
-    for (const t of [...pending.values()]) {
-      if (stop || Date.now() >= hardEnd) break
-      if (!pending.has(t.id)) continue
+  /**
+   * 给一个空闲 slot 选目标：
+   *   1) 「当前没在飞、且与在飞科目课位不冲突」里优先级最高的那门；
+   *   2) 都占满了 → 把这一发加到优先级最高的在飞科目上（同一门课并行抢同一个名额）。
+   * 这样任意时刻在飞的科目两两不冲突，同时允许同一门课多发并行。
+   */
+  function takeTarget() {
+    const held = [...busy.values()].map((b) => b.slots)
+    for (const t of pending.values()) {
+      if (busy.has(t.id)) continue
+      if (held.some((s) => conflicts(s, t.slots))) continue
+      return t
+    }
+    for (const t of pending.values()) if (busy.has(t.id)) return t
+    return null
+  }
 
-      for (let b = 0; b < OPT.burst; b++) {
-        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
-        const res = OPT.dryRun
-          ? { kind: 'retry', msg: `DRY-RUN 本应 POST ${URLS.addSign}  body=project_id=${t.id}&type=${OPT.type}` }
-          : await addSign(t.id, OPT.type)
+  function progress(t, res) {
+    process.stdout.write(`\r  待抢${pending.size} 已定${targets.length - pending.size} POST累计${postCount}  #${t.id}: ${String(res.msg).slice(0, 30)}          `)
+  }
 
-        if (res.kind === 'success') {
-          console.log(`  [${elapsed}s] ✓ 成功  #${t.id} 课位${t.pos} ${t.name} —— ${res.msg}`)
-          done.set(t.id, res); pending.delete(t.id); won = true
-          for (const o of [...pending.values()]) {
-            if (conflicts(t.slots, o.slots)) {
-              console.log(`            ⛔ 停止 #${o.id}（课位${o.pos} 与 #${t.id} 冲突）`)
-              done.set(o.id, { kind: 'conflict', msg: `与已成功的 #${t.id} 课位冲突` })
-              pending.delete(o.id)
-            }
-          }
-          break
-        }
-        if (res.kind === 'already') { console.log(`  [${elapsed}s] ○ #${t.id} ${t.name} —— ${res.msg}（视为已有，停止）`); done.set(t.id, res); pending.delete(t.id); break }
-        if (res.kind === 'full') { console.log(`  [${elapsed}s] ✗ #${t.id} ${t.name} —— ${res.msg}（已满，停止重试）`); done.set(t.id, res); pending.delete(t.id); break }
-        if (res.kind === 'loggedout') {
-          console.log(`  [${elapsed}s] ! 登录失效，自动重新登录…`)
-          await rm(SESSION_FILE, { force: true })
-          if (!(await ensureLogin())) { stop = true; break }
-          continue
-        }
-        if (res.kind === 'aborted') { stop = true; break }
-        if (b === OPT.burst - 1) {
-          process.stdout.write(`\r  第${round}轮 待抢${pending.size} POST累计${postCount}  #${t.id}: ${String(res.msg).slice(0, 30)}          `)
+  /** 结算一发：成功 / 已选 / 已满 立刻终止该门；同一门多发并发时只认最好的一发 */
+  async function settle(t, res, at) {
+    if (res.kind === 'loggedout') { await reloginOnce(at); return }
+    if (res.kind === 'aborted') { stop = true; return }
+    if (res.kind === 'retry') {
+      if (!done.has(t.id)) progress(t, res) // 已被并发的兄弟发判死，就不再刷这门的进度
+      return
+    }
+    const prev = done.get(t.id)
+    if (prev && RANK[prev.kind] <= RANK[res.kind]) return // 已有更好（或同样好）的一发
+    done.set(t.id, res)
+    pending.delete(t.id)
+    const stops = [] // 课位冲突要停的门，跟报成功那一行一起打，别拆开
+    if (res.kind === 'success') {
+      for (const o of [...pending.values()]) {
+        if (conflicts(t.slots, o.slots)) {
+          stops.push(`            ⛔ 停止 #${o.id}（课位${o.pos} 与 #${t.id} 冲突）`)
+          done.set(o.id, { kind: 'conflict', msg: `与已成功的 #${t.id} 课位冲突` })
+          pending.delete(o.id)
         }
       }
-      if (won) break
     }
-
-    if (stop || pending.size === 0) break
-    await new Promise((r) => setTimeout(r, OPT.interval * (0.8 + Math.random() * 0.4)))
+    if ((busy.get(t.id)?.refs ?? 0) > 1) return // 同一门正被多发并发抢，结果交给末尾汇总行
+    const elapsed = ((at - startedAt) / 1000).toFixed(1)
+    if (res.kind === 'success') console.log(`  [${elapsed}s] ✓ 成功  #${t.id} 课位${t.pos} ${t.name} —— ${res.msg}`)
+    else if (res.kind === 'already') console.log(`  [${elapsed}s] ○ #${t.id} ${t.name} —— ${res.msg}（视为已有，停止）`)
+    else console.log(`  [${elapsed}s] ✗ #${t.id} ${t.name} —— ${res.msg}（已满，停止重试）`)
+    for (const line of stops) console.log(line)
   }
+
+  function release(t) {
+    const b = busy.get(t.id)
+    if (b && --b.refs <= 0) busy.delete(t.id)
+  }
+
+  function hold(t) {
+    const b = busy.get(t.id)
+    if (b) b.refs++
+    else busy.set(t.id, { slots: t.slots, refs: 1 })
+  }
+
+  // 同一门课被多发并发抢：先到的一发定结果，后面更差的一发不再重复上报；
+  // 并发中的一门课只留末尾汇总行，避免先报「已满」又报「成功」这种自相矛盾的话。
+
+  // 登录失效：并发下多发可能同时报失效，重登只做一次，其余等着同一个任务
+  let reloginTask = null
+  function reloginOnce(at) {
+    if (!reloginTask) {
+      console.log(`  [${((at - startedAt) / 1000).toFixed(1)}s] ! 登录失效，自动重新登录…`)
+      reloginTask = (async () => {
+        await rm(SESSION_FILE, { force: true })
+        if (!(await ensureLogin())) stop = true
+      })().finally(() => { reloginTask = null })
+    }
+    return reloginTask
+  }
+
+  /** 一个常驻 slot：抢到一门课后连发 burst 次，然后立刻去抢下一门 */
+  async function worker() {
+    while (!stop && Date.now() < hardEnd) {
+      const t = takeTarget()
+      if (!t) return
+      hold(t)
+      try {
+        for (let b = 0; b < OPT.burst; b++) {
+          if (stop || Date.now() >= hardEnd) break
+          const at = Date.now()
+          const res = OPT.dryRun
+            ? { kind: 'retry', msg: `DRY-RUN 本应 POST ${URLS.addSign}  body=project_id=${t.id}&type=${OPT.type}` }
+            : await addSign(t.id, OPT.type)
+          await settle(t, res, at)
+          if (res.kind !== 'retry') break
+        }
+      } finally {
+        release(t)
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: OPT.concurrency }, () => worker()))
 
   // ─────── 收尾 ───────
   console.log(`\n${'═'.repeat(74)}\n  抢课结束\n${'═'.repeat(74)}`)
@@ -490,7 +608,7 @@ async function main() {
     console.log(`  ${icon} #${t.id} 课位${String(t.pos).padEnd(5)} ${t.name} —— ${d ? d.msg : '未获结果（时间到/被中断）'}`)
   }
 
-  console.log(`\nPOST 总数：${postCount}（上限 ${OPT.maxPosts}）   轮次：${round}   耗时：${((Date.now() - startedAt) / 1000).toFixed(1)}s`)
+  console.log(`\nPOST 总数：${postCount}（上限 ${OPT.maxPosts}）   并发：${OPT.concurrency}   耗时：${((Date.now() - startedAt) / 1000).toFixed(1)}s`)
   console.log(`\n全部 HTTP 请求（${requestLog.length} 条）：`)
   for (const r of requestLog) {
     console.log(`  ${r.method.padEnd(4)} ${String(r.status).padStart(3)}  ${String(r.url).padEnd(22)} ${String(r.ms).padStart(5)}ms${r.body ? `  body=${r.body}` : ''}${r.error ? `  error=${r.error}` : ''}`)
