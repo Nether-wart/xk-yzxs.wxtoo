@@ -4,6 +4,9 @@
 下次运行直接复用 —— 不重复登录、不重复发 POST。
 
 ### 用法：
+
+**分校请把xk.js中的常量BASE改成"https://yzxs.wxtoo.cn/thxc"或者"https://yzxs.wxtoo.cn/liangxi"**
+
 先在config.json中填写账号信息，`name`是姓名，`id_number`是身份证(string)，示例
 ```json
 {

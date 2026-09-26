@@ -5,6 +5,7 @@
  * 只用 Node 内置 fetch，自己维护 Cookie；登录后把会话缓存到本地，
  * 下次运行直接复用 —— 不重复登录、不重复发 POST。
  *
+ * 分校请把常量BASE改成"https://yzxs.wxtoo.cn/thxc"或者"https://yzxs.wxtoo.cn/liangxi"
  * 用法：
  *   node xk.mjs --check                        检查登录态 + 当前已选（不抢课）
  *   node xk.mjs --list                         列出全部课程（不发任何 POST）
